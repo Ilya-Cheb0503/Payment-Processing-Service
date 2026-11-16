@@ -1,0 +1,115 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_USER: payments
+      POSTGRES_PASSWORD: payments
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payments -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    environment:
+      RABBITMQ_DEFAULT_USER: payments
+      RABBITMQ_DEFAULT_PASS: payments
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+
+  migrate:
+    build: .
+    command: ["alembic", "upgrade", "head"]
+    environment: &app-env
+      API_KEY: ${API_KEY:-dev-api-key-change-me}
+      DATABASE_URL: postgresql+asyncpg://payments:payments@postgres:5432/payments
+      RABBITMQ_URL: amqp://payments:payments@rabbitmq:5672/
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      GATEWAY_MIN_DELAY_SECONDS: ${GATEWAY_MIN_DELAY_SECONDS:-2}
+      GATEWAY_MAX_DELAY_SECONDS: ${GATEWAY_MAX_DELAY_SECONDS:-5}
+      GATEWAY_SUCCESS_RATE: ${GATEWAY_SUCCESS_RATE:-0.9}
+      WEBHOOK_TIMEOUT_SECONDS: ${WEBHOOK_TIMEOUT_SECONDS:-5}
+      OUTBOX_POLL_INTERVAL_SECONDS: ${OUTBOX_POLL_INTERVAL_SECONDS:-1}
+      RETRY_TTL_MS_1: ${RETRY_TTL_MS_1:-1000}
+      RETRY_TTL_MS_2: ${RETRY_TTL_MS_2:-4000}
+      MAX_PROCESSING_ATTEMPTS: ${MAX_PROCESSING_ATTEMPTS:-3}
+      MAX_WEBHOOK_ATTEMPTS: ${MAX_WEBHOOK_ATTEMPTS:-3}
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    build: .
+    command: ["uvicorn", "payment_service.api.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    environment:
+      <<: *app-env
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "8000:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    stop_grace_period: 20s
+
+  consumer:
+    build: .
+    command: ["python", "-m", "payment_service.worker"]
+    environment:
+      <<: *app-env
+    env_file:
+      - path: .env
+        required: false
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    stop_grace_period: 35s
+    healthcheck:
+      test: ["CMD-SHELL", "python -c 'import socket; s=socket.create_connection((\"rabbitmq\",5672),2); s.close()'"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+
+  webhook-mock:
+    build: .
+    command: ["python", "-m", "payment_service.webhook_mock"]
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  postgres_data:
